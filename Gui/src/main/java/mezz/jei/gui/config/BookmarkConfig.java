@@ -16,6 +16,7 @@ import net.minecraft.nbt.TagParser;
 import net.minecraft.world.item.ItemStack;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
+import org.jetbrains.annotations.Nullable;
 
 import java.io.IOException;
 import java.nio.file.Files;
@@ -27,8 +28,11 @@ import java.util.Optional;
 
 public class BookmarkConfig implements IBookmarkConfig {
 	private static final Logger LOGGER = LogManager.getLogger();
-	private static final String MARKER_OTHER = "O:";
-	private static final String MARKER_STACK = "T:";
+
+	static final String MARKER_STACK = "T:";
+	static final String MARKER_INGREDIENT = "I:";
+	static final String LEGACY_MARKER_OTHER = "O:";
+
 	private final Path jeiConfigurationDir;
 
 	private static Optional<Path> getPath(Path jeiConfigurationDir) {
@@ -59,7 +63,7 @@ public class BookmarkConfig implements IBookmarkConfig {
 					if (typedIngredient.getIngredient() instanceof ItemStack stack) {
 						strings.add(MARKER_STACK + stack.save(new CompoundTag()));
 					} else {
-						strings.add(MARKER_OTHER + getUid(ingredientManager, typedIngredient));
+						strings.add(MARKER_INGREDIENT + getUid(ingredientManager, typedIngredient));
 					}
 				}
 
@@ -78,60 +82,76 @@ public class BookmarkConfig implements IBookmarkConfig {
 				if (!Files.exists(path)) {
 					return;
 				}
-				List<String> ingredientJsonStrings;
+				List<String> lines;
 				try {
-					ingredientJsonStrings = Files.readAllLines(path);
+					lines = Files.readAllLines(path);
 				} catch (IOException e) {
 					LOGGER.error("Failed to load bookmarks from file {}", path, e);
 					return;
 				}
 
-				Collection<IIngredientType<?>> otherIngredientTypes = ingredientManager.getRegisteredIngredientTypes()
-						.stream()
-						.filter(i -> !i.equals(VanillaTypes.ITEM_STACK))
-						.toList();
-
 				IIngredientHelper<ItemStack> itemStackHelper = ingredientManager.getIngredientHelper(VanillaTypes.ITEM_STACK);
-
-				for (String ingredientJsonString : ingredientJsonStrings) {
-					if (ingredientJsonString.startsWith(MARKER_STACK)) {
-						String itemStackAsJson = ingredientJsonString.substring(MARKER_STACK.length());
-						try {
-							CompoundTag itemStackAsNbt = TagParser.parseTag(itemStackAsJson);
-							ItemStack itemStack = ItemStack.of(itemStackAsNbt);
-							if (!itemStack.isEmpty()) {
-								ItemStack normalized = itemStackHelper.normalizeIngredient(itemStack);
-								Optional<ITypedIngredient<ItemStack>> typedIngredient = ingredientManager.createTypedIngredient(VanillaTypes.ITEM_STACK, normalized);
-								if (typedIngredient.isEmpty()) {
-									LOGGER.warn("Failed to load bookmarked ItemStack from json string, the item no longer exists:\n{}", itemStackAsJson);
-								} else {
-									IngredientBookmark<ItemStack> bookmark = IngredientBookmark.create(typedIngredient.get(), ingredientManager);
-									bookmarkList.addToListWithoutNotifying(bookmark, false);
-								}
-							} else {
-								LOGGER.warn("Failed to load bookmarked ItemStack from json string, the item no longer exists:\n{}", itemStackAsJson);
-							}
-						} catch (CommandSyntaxException e) {
-							LOGGER.error("Failed to load bookmarked ItemStack from json string:\n{}", itemStackAsJson, e);
-						}
-					} else if (ingredientJsonString.startsWith(MARKER_OTHER)) {
-						String uid = ingredientJsonString.substring(MARKER_OTHER.length());
-						Optional<ITypedIngredient<?>> typedIngredient = getNormalizedIngredientByUid(ingredientManager, otherIngredientTypes, uid);
-						if (typedIngredient.isEmpty()) {
-							LOGGER.error("Failed to load unknown bookmarked ingredient:\n{}", ingredientJsonString);
-						} else {
-							IngredientBookmark<?> bookmark = IngredientBookmark.create(typedIngredient.get(), ingredientManager);
-							bookmarkList.addToListWithoutNotifying(bookmark, false);
-						}
+				for (String line : lines) {
+					IBookmark bookmark = null;
+					if (line.startsWith(MARKER_STACK)) {
+						String itemStackAsJson = line.substring(MARKER_STACK.length());
+						bookmark = loadItemStackBookmark(itemStackHelper, ingredientManager, itemStackAsJson);
+					} else if (line.startsWith(MARKER_INGREDIENT)) {
+						String uid = line.substring(MARKER_INGREDIENT.length());
+						bookmark = loadIngredientBookmark(ingredientManager, uid);
+					} else if (line.startsWith(LEGACY_MARKER_OTHER)) {
+						String uid = line.substring(LEGACY_MARKER_OTHER.length());
+						bookmark = loadIngredientBookmark(ingredientManager, uid);
 					} else {
-						LOGGER.error("Failed to load unknown bookmarked ingredient:\n{}", ingredientJsonString);
+						LOGGER.error("Failed to load unknown bookmark type:\n{}", line);
+					}
+					if (bookmark != null) {
+						bookmarkList.addToListWithoutNotifying(bookmark, false);
 					}
 				}
 				bookmarkList.notifyListenersOfChange();
 			});
 	}
 
-	private static <T> String getUid(IIngredientManager ingredientManager, ITypedIngredient<T> typedIngredient) {
+	static @Nullable IBookmark loadItemStackBookmark(
+		IIngredientHelper<ItemStack> itemStackHelper,
+		IIngredientManager ingredientManager,
+		String itemStackAsJson
+	) {
+		try {
+			CompoundTag itemStackAsNbt = TagParser.parseTag(itemStackAsJson);
+			ItemStack itemStack = ItemStack.of(itemStackAsNbt);
+			if (!itemStack.isEmpty()) {
+				ItemStack normalized = itemStackHelper.normalizeIngredient(itemStack);
+				Optional<ITypedIngredient<ItemStack>> typedIngredient = ingredientManager.createTypedIngredient(VanillaTypes.ITEM_STACK, normalized);
+				if (typedIngredient.isEmpty()) {
+					LOGGER.warn("Failed to load bookmarked ItemStack from json string, the item no longer exists:\n{}", itemStackAsJson);
+				} else {
+					return IngredientBookmark.create(typedIngredient.get(), ingredientManager);
+				}
+			} else {
+				LOGGER.warn("Failed to load bookmarked ItemStack from json string, the item is empty:\n{}", itemStackAsJson);
+			}
+		} catch (CommandSyntaxException e) {
+			LOGGER.error("Failed to load bookmarked ItemStack from json string:\n{}", itemStackAsJson, e);
+		}
+		return null;
+	}
+
+	static @Nullable IBookmark loadIngredientBookmark(IIngredientManager ingredientManager, String uid) {
+		Collection<IIngredientType<?>> otherIngredientTypes = ingredientManager.getRegisteredIngredientTypes()
+			.stream()
+			.filter(i -> !i.equals(VanillaTypes.ITEM_STACK))
+			.toList();
+		Optional<ITypedIngredient<?>> typedIngredient = getNormalizedIngredientByUid(ingredientManager, otherIngredientTypes, uid);
+		if (typedIngredient.isEmpty()) {
+			LOGGER.error("Failed to load unknown bookmarked ingredient with uid:\n{}", uid);
+			return null;
+		}
+		return IngredientBookmark.create(typedIngredient.get(), ingredientManager);
+	}
+
+	static <T> String getUid(IIngredientManager ingredientManager, ITypedIngredient<T> typedIngredient) {
 		IIngredientHelper<T> ingredientHelper = ingredientManager.getIngredientHelper(typedIngredient.getType());
 		return ingredientHelper.getUniqueId(typedIngredient.getIngredient(), UidContext.Ingredient);
 	}
